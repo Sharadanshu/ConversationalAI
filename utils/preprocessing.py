@@ -318,6 +318,122 @@ def deserialize_tags(column_value: str) -> List[str]:
     return list(json.loads(column_value))
 
 
+def compute_wordpiece_oov_rate(dataframe: pd.DataFrame, model_name: str = "bert-base-uncased") -> Dict[str, float]:
+    try:
+        from transformers import AutoTokenizer
+    except Exception as exc:  # pragma: no cover - optional dependency path
+        return {
+            "oov_rate": 0.0,
+            "tokens": 0,
+            "unk_tokens": 0,
+            "fallback": 1.0,
+        }
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    total = 0
+    unknown = 0
+    wordpieces = 0
+    for tokens_serialized in dataframe["tokens"]:
+        tokens = deserialize_tokens(tokens_serialized)
+        for token in tokens:
+            total += 1
+            pieces = tokenizer.tokenize(token)
+            if not pieces or pieces == [tokenizer.unk_token]:
+                unknown += 1
+            wordpieces += max(1, len(pieces))
+    return {
+        "oov_rate": unknown / total if total else 0.0,
+        "tokens": float(total),
+        "unk_tokens": float(unknown),
+        "avg_wordpieces_per_token": wordpieces / total if total else 0.0,
+    }
+
+
+def compute_subword_oov_rate(dataframe: pd.DataFrame, tokenizer: SimpleBPETokenizer) -> float:
+    total = 0
+    missing = 0
+    for tokens_serialized in dataframe["tokens"]:
+        tokens = deserialize_tokens(tokens_serialized)
+        subwords, _ = tokenizer.encode_tokens(tokens)
+        for token in subwords:
+            total += 1
+            if token not in tokenizer.token_to_id:
+                missing += 1
+    return missing / total if total else 0.0
+
+
+def compute_tokenizer_oov_comparison(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    tokenizer: SimpleBPETokenizer,
+    bert_model_name: str = "bert-base-uncased",
+) -> Dict[str, float]:
+    basic_vocab = set(compute_basic_vocab(train_df))
+    report = {
+        "basic_oov_val": compute_oov_rate(val_df, basic_vocab),
+        "basic_oov_test": compute_oov_rate(test_df, basic_vocab),
+        "bpe_oov_val": compute_subword_oov_rate(val_df, tokenizer),
+        "bpe_oov_test": compute_subword_oov_rate(test_df, tokenizer),
+    }
+    bert_val = compute_wordpiece_oov_rate(val_df, model_name=bert_model_name)
+    bert_test = compute_wordpiece_oov_rate(test_df, model_name=bert_model_name)
+    report.update(
+        {
+            "bert_wordpiece_oov_val": bert_val["oov_rate"],
+            "bert_wordpiece_oov_test": bert_test["oov_rate"],
+            "bert_avg_wordpieces_per_token_val": bert_val.get("avg_wordpieces_per_token", 0.0),
+            "bert_avg_wordpieces_per_token_test": bert_test.get("avg_wordpieces_per_token", 0.0),
+            "bert_model_name": bert_model_name,
+        }
+    )
+    return report
+
+
+def generate_ood_test_cases() -> pd.DataFrame:
+    cases = [
+        {"sentence": "plz book 2 vip for dune", "intent": "book_ticket", "category": "slang", "entities": {"NUM_TICKETS": "2", "SEAT_TYPE": "vip", "MOVIE_NAME": "dune"}},
+        {"sentence": "showtime for oppenheimer?", "intent": "check_showtime", "category": "incomplete", "entities": {"MOVIE_NAME": "oppenheimer"}},
+        {"sentence": "can u cncl my booking", "intent": "cancel_ticket", "category": "misspelling", "entities": {}},
+        {"sentence": "need seats for avatar at dolby", "intent": "book_ticket", "category": "unseen_entity", "entities": {"MOVIE_NAME": "avatar", "SCREEN_TYPE": "dolby"}},
+        {"sentence": "hello maybe pvr on friday", "intent": "search_movie", "category": "ambiguous", "entities": {"THEATER_NAME": "pvr", "DATE": "friday"}},
+        {"sentence": "book for 5 at 9 pm", "intent": "book_ticket", "category": "incomplete", "entities": {"NUM_TICKETS": "5", "TIME": "9 pm"}},
+        {"sentence": "what is my booking statuz", "intent": "check_booking_status", "category": "misspelling", "entities": {}},
+        {"sentence": "any telugu movies in pune today", "intent": "search_movie", "category": "unseen_entity", "entities": {"LANGUAGE": "telugu", "CITY": "pune", "DATE": "today"}},
+        {"sentence": "yo need a seat A99", "intent": "select_seat", "category": "slang", "entities": {"SEAT_NUMBER": "A99"}},
+        {"sentence": "show me dune timings at nova cineplex", "intent": "check_showtime", "category": "unseen_entity", "entities": {"MOVIE_NAME": "dune", "THEATER_NAME": "nova cineplex"}},
+        {"sentence": "cancel it", "intent": "cancel_ticket", "category": "incomplete", "entities": {}},
+        {"sentence": "book IMAX for barbie tomorrow", "intent": "book_ticket", "category": "ambiguous", "entities": {"SCREEN_TYPE": "IMAX", "MOVIE_NAME": "barbie", "DATE": "tomorrow"}},
+        {"sentence": "pls help find movie in mumbai", "intent": "search_movie", "category": "slang", "entities": {"CITY": "mumbai"}},
+        {"sentence": "when is leo at 7?", "intent": "check_showtime", "category": "incomplete", "entities": {"MOVIE_NAME": "leo", "TIME": "7"}},
+        {"sentence": "choose recliner b12", "intent": "select_seat", "category": "misspelling", "entities": {"SEAT_TYPE": "recliner", "SEAT_NUMBER": "B12"}},
+        {"sentence": "i need 3 tickets for unseen movie zeta", "intent": "book_ticket", "category": "unseen_entity", "entities": {"NUM_TICKETS": "3", "MOVIE_NAME": "zeta"}},
+        {"sentence": "good morning is my ticket ok", "intent": "check_booking_status", "category": "ambiguous", "entities": {}},
+        {"sentence": "hey book in 3d for today", "intent": "book_ticket", "category": "slang", "entities": {"SCREEN_TYPE": "3D", "DATE": "today"}},
+        {"sentence": "search something near me", "intent": "search_movie", "category": "ambiguous", "entities": {}},
+        {"sentence": "refund tomorrow pvr", "intent": "cancel_ticket", "category": "incomplete", "entities": {"DATE": "tomorrow", "THEATER_NAME": "pvr"}},
+    ]
+    return pd.DataFrame(cases)
+
+
+def build_entity_performance_table(entity_report: Dict[str, Dict[str, float]]) -> pd.DataFrame:
+    rows = []
+    for label, metrics in entity_report.items():
+        rows.append(
+            {
+                "entity": label,
+                "strict_precision": metrics.get("strict_precision", 0.0),
+                "strict_recall": metrics.get("strict_recall", 0.0),
+                "strict_f1": metrics.get("strict_f1", 0.0),
+                "partial_precision": metrics.get("partial_precision", 0.0),
+                "partial_recall": metrics.get("partial_recall", 0.0),
+                "partial_f1": metrics.get("partial_f1", 0.0),
+                "support": metrics.get("support", 0.0),
+            }
+        )
+    return pd.DataFrame(rows).sort_values(["strict_f1", "support"], ascending=[False, False]).reset_index(drop=True)
+
+
 def align_tags_to_subwords(tags: Sequence[str], alignment: Sequence[Sequence[str]]) -> List[str]:
     subword_tags: List[str] = []
     for tag, pieces in zip(tags, alignment):

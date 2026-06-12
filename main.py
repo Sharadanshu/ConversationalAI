@@ -19,7 +19,7 @@ import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
-from llm.prompting import SimulatedLLMPipeline, build_prompt, spans_from_entities
+from llm.prompting import LLMConfig, RealLLMPipeline, SimulatedLLMPipeline, build_prompt, create_llm_pipeline, spans_from_entities
 from models.encoder_model import MovieBookingEncoder
 from utils.metrics import classification_metrics, confusion_matrix, entity_metrics, model_size_mb, summarize_latencies
 from utils.preprocessing import (
@@ -31,11 +31,14 @@ from utils.preprocessing import (
     build_label_maps,
     compute_basic_vocab,
     compute_oov_rate,
+    compute_tokenizer_oov_comparison,
     dataset_statistics,
     deserialize_tokens,
     deserialize_tags,
     encode_dataframe,
+    build_entity_performance_table,
     entity_distribution,
+    generate_ood_test_cases,
     generate_synthetic_dataset,
     load_json,
     save_json,
@@ -135,17 +138,7 @@ def compute_subword_oov_rate(dataframe: pd.DataFrame, tokenizer: SimpleBPETokeni
 
 
 def compute_tokenizer_report(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFrame, tokenizer: SimpleBPETokenizer) -> Dict[str, float]:
-    basic_vocab = set(compute_basic_vocab(train_df))
-    basic_oov_val = compute_oov_rate(val_df, basic_vocab)
-    basic_oov_test = compute_oov_rate(test_df, basic_vocab)
-    subword_oov_val = compute_subword_oov_rate(val_df, tokenizer)
-    subword_oov_test = compute_subword_oov_rate(test_df, tokenizer)
-    report = {
-        "basic_oov_val": basic_oov_val,
-        "basic_oov_test": basic_oov_test,
-        "subword_oov_val": subword_oov_val,
-        "subword_oov_test": subword_oov_test,
-    }
+    report = compute_tokenizer_oov_comparison(train_df, val_df, test_df, tokenizer)
     save_json(str(DATA_DIR / "tokenizer_report.json"), report)
     return report
 
@@ -353,7 +346,7 @@ def evaluate_encoder_model(
 
 
 def evaluate_llm_pipeline(test_df: pd.DataFrame, strategies: Sequence[str] = ("zero_shot", "few_shot", "structured_json")) -> Dict[str, object]:
-    pipeline = SimulatedLLMPipeline(seed=42)
+    pipeline = create_llm_pipeline(seed=42)
     strategy_results: Dict[str, object] = {}
     for strategy in strategies:
         intent_true: List[str] = []
@@ -398,6 +391,8 @@ def evaluate_llm_pipeline(test_df: pd.DataFrame, strategies: Sequence[str] = ("z
             "entity_metrics": entity_metrics(gold_entity_sequences, pred_entity_sequences),
             "latency_metrics": summarize_latencies(latencies),
             "cost_estimate": total_cost,
+            "cost_estimate_per_1000": (total_cost / max(1, len(test_df))) * 1000.0,
+            "avg_cost_per_query": total_cost / max(1, len(test_df)),
             "model_size_mb": 0.0,
             "intent_true": intent_true,
             "pred_intents": intent_pred,
@@ -439,6 +434,10 @@ def generate_adversarial_samples(test_df: pd.DataFrame, count: int = 20, seed: i
         sentence = " ".join(mutated)
         samples.append({"sentence": sentence, "intent": row["intent"], "tokens": json.dumps(mutated), "BIO_tags": row["BIO_tags"]})
     return pd.DataFrame(samples)
+
+
+def generate_ood_test_suite() -> pd.DataFrame:
+    return generate_ood_test_cases()
 
 
 def intent_confusion_figure(y_true: Sequence[str], y_pred: Sequence[str], title: str, path: Path) -> None:

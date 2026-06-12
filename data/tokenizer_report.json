@@ -1,6 +1,11 @@
 {
   "basic_oov_val": 0.019250253292806486,
   "basic_oov_test": 0.019569471624266144,
-  "subword_oov_val": 0.006641366223908918,
-  "subword_oov_test": 0.010242085661080074
+  "bpe_oov_val": 0.006641366223908918,
+  "bpe_oov_test": 0.010242085661080074,
+  "bert_wordpiece_oov_val": 0.0,
+  "bert_wordpiece_oov_test": 0.0,
+  "bert_avg_wordpieces_per_token_val": 1.1854103343465046,
+  "bert_avg_wordpieces_per_token_test": 1.1457925636007829,
+  "bert_model_name": "bert-base-uncased"
 }

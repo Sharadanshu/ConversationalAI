@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
+import os
 import random
 import re
+import urllib.error
+import urllib.request
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from utils.preprocessing import ENTITY_BANK, INTENTS
 
@@ -30,7 +34,8 @@ PROMPT_EXAMPLES = [
 def build_prompt(sentence: str, strategy: str = "structured_json") -> str:
     base_instructions = (
         "You are a movie booking assistant. Classify the user's intent and extract entities. "
-        "Return a JSON object with keys intent and entities."
+        "Return a valid JSON object with keys intent and entities. "
+        "Do not include markdown fences, prose, or explanations."
     )
     if strategy == "zero_shot":
         return f"{base_instructions}\nUser: {sentence}\nJSON:"
@@ -46,6 +51,12 @@ def build_prompt(sentence: str, strategy: str = "structured_json") -> str:
             f"User: {sentence}\nAssistant:"
         )
     raise ValueError(f"Unknown strategy: {strategy}")
+
+
+def build_structured_prompt(sentence: str, strategy: str = "structured_json") -> str:
+    prompt = build_prompt(sentence, strategy=strategy)
+    schema = '{"intent": string, "entities": {label: value}, "confidence": number optional}'
+    return f"{prompt}\nRequired schema: {schema}"
 
 
 def _stable_random(sentence: str, strategy: str, seed: int) -> random.Random:
@@ -144,23 +155,38 @@ def safe_parse_json_output(raw_output: str) -> Dict[str, object]:
     if cleaned.startswith("```"):
         cleaned = re.sub(r"^```(?:json)?", "", cleaned).strip()
         cleaned = re.sub(r"```$", "", cleaned).strip()
+    candidate_strings = []
     match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
     if match:
-        candidate = match.group(0)
+        candidate_strings.append(match.group(0))
+    candidate_strings.append(cleaned)
+    for candidate in candidate_strings:
         try:
-            return json.loads(candidate)
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict):
+                return parsed
         except json.JSONDecodeError:
             pass
+        try:
+            parsed = ast.literal_eval(candidate)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
     intent_match = re.search(r'"?intent"?\s*[:=]\s*"?([a-z_]+)"?', cleaned, flags=re.IGNORECASE)
+    entity_pairs = re.findall(r'"?([A-Z_]+)"?\s*[:=]\s*"?([^",\n\}]+)"?', cleaned)
+    entities = {label: value.strip() for label, value in entity_pairs if label != "INTENT"}
     if intent_match:
-        return {"intent": intent_match.group(1), "entities": {}}
-    return {"intent": "unknown", "entities": {}}
+        return {"intent": intent_match.group(1), "entities": entities}
+    return {"intent": "unknown", "entities": entities}
 
 
 @dataclass
 class LLMResult:
     sentence: str
     strategy: str
+    provider: str
+    model: str
     prompt: str
     raw_output: str
     parsed_output: Dict[str, object]
@@ -168,6 +194,101 @@ class LLMResult:
     prompt_tokens: int
     completion_tokens: int
     estimated_cost: float
+    estimated_cost_per_1000: float
+
+
+@dataclass
+class LLMConfig:
+    provider: str = "simulated"
+    model: str = "simulated"
+    base_url: str = ""
+    api_key: str = ""
+    temperature: float = 0.0
+    max_tokens: int = 256
+    request_timeout: int = 60
+    prompt_cost_per_1k: float = 0.0
+    completion_cost_per_1k: float = 0.0
+
+
+def _estimate_tokens(text: str) -> int:
+    return len(re.findall(r"\w+|[^\w\s]", text))
+
+
+class BaseLLMClient:
+    def generate(self, prompt: str, strategy: str) -> Tuple[str, Dict[str, int]]:
+        raise NotImplementedError
+
+
+class OpenAICompatibleClient(BaseLLMClient):
+    def __init__(self, config: LLMConfig) -> None:
+        self.config = config
+
+    def generate(self, prompt: str, strategy: str) -> Tuple[str, Dict[str, int]]:
+        url = self.config.base_url.rstrip("/") + "/chat/completions"
+        payload = {
+            "model": self.config.model,
+            "messages": [
+                {"role": "system", "content": "You are a precise JSON-only assistant for movie booking NLU."},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": self.config.temperature,
+            "max_tokens": self.config.max_tokens,
+        }
+        data = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json", "Authorization": f"Bearer {self.config.api_key}"})
+        with urllib.request.urlopen(request, timeout=self.config.request_timeout) as response:
+            raw = response.read().decode("utf-8")
+        parsed = json.loads(raw)
+        content = parsed["choices"][0]["message"]["content"]
+        usage = parsed.get("usage", {}) if isinstance(parsed, dict) else {}
+        tokens = {
+            "prompt_tokens": int(usage.get("prompt_tokens", _estimate_tokens(prompt))),
+            "completion_tokens": int(usage.get("completion_tokens", _estimate_tokens(content))),
+        }
+        return content, tokens
+
+
+class TransformersClient(BaseLLMClient):
+    def __init__(self, model_name: str, max_new_tokens: int = 128) -> None:
+        self.model_name = model_name
+        self.max_new_tokens = max_new_tokens
+        self._tokenizer = None
+        self._model = None
+
+    def _load(self) -> None:
+        if self._tokenizer is not None and self._model is not None:
+            return
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        import torch
+
+        self._tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+        self._model = AutoModelForCausalLM.from_pretrained(self.model_name, torch_dtype=torch.float32)
+        self._model.eval()
+
+    def generate(self, prompt: str, strategy: str) -> Tuple[str, Dict[str, int]]:
+        self._load()
+        import torch
+
+        tokenized = self._tokenizer(prompt, return_tensors="pt")
+        with torch.no_grad():
+            generated = self._model.generate(**tokenized, max_new_tokens=self.max_new_tokens, do_sample=False)
+        prompt_length = int(tokenized["input_ids"].shape[-1])
+        text = self._tokenizer.decode(generated[0][prompt_length:], skip_special_tokens=True)
+        return text, {"prompt_tokens": prompt_length, "completion_tokens": max(1, _estimate_tokens(text))}
+
+
+def _default_llm_config() -> LLMConfig:
+    provider = os.environ.get("LLM_PROVIDER", "simulated").strip().lower()
+    model = os.environ.get("LLM_MODEL", "llama-3.1-8b-instant")
+    base_url = os.environ.get("LLM_BASE_URL", "https://api.groq.com/openai/v1")
+    api_key = os.environ.get("LLM_API_KEY", "")
+    prompt_cost = float(os.environ.get("LLM_PROMPT_COST_PER_1K", "0.0"))
+    completion_cost = float(os.environ.get("LLM_COMPLETION_COST_PER_1K", "0.0"))
+    return LLMConfig(provider=provider, model=model, base_url=base_url, api_key=api_key, prompt_cost_per_1k=prompt_cost, completion_cost_per_1k=completion_cost)
+
+
+def _cost(prompt_tokens: int, completion_tokens: int, config: LLMConfig) -> float:
+    return (prompt_tokens / 1000.0) * config.prompt_cost_per_1k + (completion_tokens / 1000.0) * config.completion_cost_per_1k
 
 
 class SimulatedLLMPipeline:
@@ -193,7 +314,7 @@ class SimulatedLLMPipeline:
         return intent, raw, payload
 
     def predict(self, sentence: str, strategy: str = "structured_json") -> LLMResult:
-        prompt = build_prompt(sentence, strategy=strategy)
+        prompt = build_structured_prompt(sentence, strategy=strategy)
         start = time.perf_counter()
         _, raw_output, payload = self._generate_response(sentence, strategy)
         latency = time.perf_counter() - start
@@ -204,6 +325,8 @@ class SimulatedLLMPipeline:
         return LLMResult(
             sentence=sentence,
             strategy=strategy,
+            provider="simulated",
+            model="simulated",
             prompt=prompt,
             raw_output=raw_output,
             parsed_output=parsed_output,
@@ -211,7 +334,58 @@ class SimulatedLLMPipeline:
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             estimated_cost=estimated_cost,
+            estimated_cost_per_1000=estimated_cost * 1000,
         )
 
     def predict_batch(self, sentences: Sequence[str], strategy: str = "structured_json") -> List[LLMResult]:
         return [self.predict(sentence, strategy=strategy) for sentence in sentences]
+
+
+class RealLLMPipeline:
+    def __init__(self, config: Optional[LLMConfig] = None, seed: int = 42) -> None:
+        self.config = config or _default_llm_config()
+        self.seed = seed
+        if self.config.provider in {"openai", "groq", "openrouter", "together", "deepinfra"}:
+            self.client: BaseLLMClient = OpenAICompatibleClient(self.config)
+        elif self.config.provider in {"transformers", "local", "llama"}:
+            self.client = TransformersClient(self.config.model)
+        else:
+            self.client = SimulatedLLMPipeline(seed=seed)  # type: ignore[assignment]
+
+    def predict(self, sentence: str, strategy: str = "structured_json") -> LLMResult:
+        if isinstance(self.client, SimulatedLLMPipeline):
+            return self.client.predict(sentence, strategy=strategy)
+
+        prompt = build_structured_prompt(sentence, strategy=strategy)
+        start = time.perf_counter()
+        try:
+            raw_output, token_counts = self.client.generate(prompt, strategy=strategy)
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, KeyError, ValueError):
+            fallback = SimulatedLLMPipeline(seed=self.seed)
+            return fallback.predict(sentence, strategy=strategy)
+        latency = time.perf_counter() - start
+        parsed_output = safe_parse_json_output(raw_output)
+        prompt_tokens = int(token_counts.get("prompt_tokens", _estimate_tokens(prompt)))
+        completion_tokens = int(token_counts.get("completion_tokens", _estimate_tokens(raw_output)))
+        estimated_cost = _cost(prompt_tokens, completion_tokens, self.config)
+        return LLMResult(
+            sentence=sentence,
+            strategy=strategy,
+            provider=self.config.provider,
+            model=self.config.model,
+            prompt=prompt,
+            raw_output=raw_output,
+            parsed_output=parsed_output,
+            latency_seconds=latency,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            estimated_cost=estimated_cost,
+            estimated_cost_per_1000=estimated_cost * 1000,
+        )
+
+
+def create_llm_pipeline(config: Optional[LLMConfig] = None, seed: int = 42):
+    resolved = config or _default_llm_config()
+    if resolved.provider == "simulated" and not resolved.api_key:
+        return SimulatedLLMPipeline(seed=seed)
+    return RealLLMPipeline(config=resolved, seed=seed)
